@@ -21,8 +21,12 @@ app.use(cors());
 app.use(express.json());
 
 // Set up Multer for handling file uploads (stored in memory)
+// Enforces a strict 10MB limit to prevent memory exhaustion from large scans
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
+});
 
 // Initialize Groq SDK
 const groq = new Groq({
@@ -252,6 +256,10 @@ app.get('/api/dashboard', authenticateToken as any, async (req: AuthRequest, res
   }
 });
 
+app.get('/health', async (req, res) => {
+  res.json({ status: "ok" })
+})
+
 /**
  * GET /api/profile
  * Returns the current authenticated surgeon profile and dynamically computed staging summaries.
@@ -340,7 +348,7 @@ app.post('/api/profile', authenticateToken as any, async (req: AuthRequest, res:
 app.post('/api/clear-cases', authenticateToken as any, async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.id || '';
-    
+
     // Wipes references cache for this user
     for (const key of referenceCache.keys()) {
       if (key.startsWith(userId + '_')) {
@@ -362,7 +370,19 @@ app.post('/api/clear-cases', authenticateToken as any, async (req: AuthRequest, 
  * Analyzes pathology report (PDF) or CT scan metadata.
  * Saves the generated case summary prefixed with the user's ID.
  */
-app.post('/api/upload', authenticateToken as any, upload.single('file'), async (req: AuthRequest, res: Response): Promise<any> => {
+app.post('/api/upload', authenticateToken as any, (req: AuthRequest, res: Response, next: NextFunction) => {
+  upload.single('file')(req as any, res as any, (err: any) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({
+          error: 'File is too large. Please upload a scan or report smaller than 10MB.',
+        });
+      }
+      return res.status(400).json({ error: err.message || 'File upload failed.' });
+    }
+    next();
+  });
+}, async (req: AuthRequest, res: Response): Promise<any> => {
   try {
     const userId = req.user?.id || '';
     const userPatientId = req.body.patientId || '';
@@ -396,15 +416,17 @@ app.post('/api/upload', authenticateToken as any, upload.single('file'), async (
 
     console.log(`Generating AI clinical summary via Groq for user ${userId}...`);
 
-    const systemPrompt = `You are an expert AI clinical decision support system for head and neck oncology surgeons.
+    const systemPrompt = `first analyze and tell if valid if invalid return just invalid
+
+You are an expert AI clinical decision support system for head and neck oncology surgeons.
 Your task is to analyze pathology reports, pathology details, or clinical scans (images) of a head/neck cancer patient and synthesize an extremely comprehensive, detailed, and high-yield structured clinical summary in JSON format.
 You must output extensive, comprehensive clinical descriptions with absolute specificity, leaving out no diagnostic indicators.
 
-First, you must perform a validation check:
-- If analyzing text, verify if it contains relevant medical, clinical, or oncological details. If not, set "isValid" to false and set "error" to "Please upload a valid pathology report or clinical documentation."
-- If analyzing an image, verify if the image is a valid medical scan (such as a CT scan, MRI scan, X-ray, PET scan, pathology slide, or DICOM slice). If the image is NOT a medical scan (for example, if it is a photo of a pet, a person, a landscape, a building, a UI mockup, or generic drawings), you MUST set "isValid" to false and set "error" to "Please upload a valid medical scan image."
+Validation Check Rules:
+- If analyzing text, verify if it contains relevant medical, clinical, or oncological details. If the text does not contain relevant oncological or medical details, it is invalid and you MUST return only the string "invalid".
+- If analyzing an image, verify if the image is a valid medical scan (such as a CT scan, MRI scan, X-ray, PET scan, pathology slide, or DICOM slice). If the image is NOT a medical scan (for example, if it is a photo of a pet, a person, a landscape, a building, a UI mockup, or generic drawings), it is invalid and you MUST return only the string "invalid".
 
-If the input is valid, you MUST set "isValid" to true and return a JSON object matching this schema exactly:
+If the input is valid, you MUST return a JSON object matching this schema exactly:
 {
   "isValid": true,
   "patientId": "string (extract from report or generate a realistic one like PT-2024-XXXX)",
@@ -459,7 +481,7 @@ Crucial Guidelines:
             content: [
               {
                 type: 'text',
-                text: `Patient report / scan details. This is an uploaded image file (${fileName}). Please analyze this scan/image and generate a structured clinical summary. If the image is a medical scan, describe the anatomical findings, tumor dimensions, and staging details you see. If it is a generic/placeholder image, synthesize a realistic and detailed head and neck cancer clinical case based on it.${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`
+                text: `Patient report / scan details. This is an uploaded image file (${fileName}). First analyze and tell if valid. If it is NOT a valid medical scan (like a CT scan or MRI scan), you MUST return only the string "invalid". If it is a valid scan, describe the anatomical findings, tumor dimensions, and staging details you see.${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`
               },
               {
                 type: 'image_url',
@@ -478,19 +500,41 @@ Crucial Guidelines:
         model: 'llama-3.3-70b-versatile',
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Patient report / imaging details:\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
+          { role: 'user', content: `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return only the string "invalid".\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
         ],
         temperature: 0.1,
       });
     }
 
     const textResponse = response.choices[0]?.message?.content || '';
-    const structuredSummary = extractJSON(textResponse);
+
+    // Check if the AI returned invalid
+    const cleanedResponse = textResponse.trim().toLowerCase();
+    if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+      console.log(`[Validation Error] AI returned invalid. Upload rejected.`);
+      return res.status(400).json({
+        error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+      });
+    }
+
+    let structuredSummary;
+    try {
+      structuredSummary = extractJSON(textResponse);
+    } catch (parseError: any) {
+      // Defensive fallback check
+      if (cleanedResponse.includes('invalid')) {
+        console.log(`[Validation Error] Parse failed but response indicates invalid.`);
+        return res.status(400).json({
+          error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+        });
+      }
+      throw parseError;
+    }
 
     // Validate report/scan correctness before proceeding
     if (structuredSummary.isValid === false || structuredSummary.isValid === 'false') {
       console.log(`[Validation Error] Upload rejected: ${structuredSummary.error}`);
-      return res.status(400).json({ error: structuredSummary.error || 'Invalid upload content.' });
+      return res.status(400).json({ error: structuredSummary.error || 'Please upload a proper clinical document or medical scan related to head and neck oncology.' });
     }
 
     // Bind this case context explicitly to the active surgeon's userId!
