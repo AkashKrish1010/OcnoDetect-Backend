@@ -54,7 +54,7 @@ const CaseSchema: Schema = new Schema({
   prognosticFactors: [{ type: String }],
   multidisciplinaryRecommendations: [{ type: String }],
   userId: { type: String, required: true },
-  confidence: { type: Number, required: true, default: 0.92 },
+  confidence: { type: Number, required: true },
   date: { type: String, required: true }
 }, { timestamps: true });
 
@@ -139,8 +139,34 @@ export async function connectDatabase() {
   try {
     await mongoose.connect(uri);
     console.log("[MongoDB] Connected successfully to DB");
+    startMongoKeepAlive();
   } catch (error) {
     console.error('[MongoDB] Connection failed:', error);
     process.exit(1);
   }
 }
+
+function startMongoKeepAlive() {
+  // Ping the database periodically to prevent the cluster from being paused due to inactivity.
+  const intervalMinutes = parseInt(process.env.MONGODB_KEEP_ALIVE_INTERVAL || '10', 10);
+  const intervalMs = intervalMinutes * 60 * 1000;
+
+  console.log(`[MongoDB Keep-Alive] Starting keep-alive ping loop every ${intervalMinutes} minutes`);
+
+  setInterval(async () => {
+    try {
+      if (mongoose.connection.readyState === 1) {
+        const db = mongoose.connection.db;
+        if (db) {
+          await db.command({ ping: 1 });
+          console.log(`[MongoDB Keep-Alive] Pinged MongoDB cluster successfully at ${new Date().toISOString()}`);
+        }
+      } else {
+        console.warn(`[MongoDB Keep-Alive] Skip ping: readyState is ${mongoose.connection.readyState} (not connected)`);
+      }
+    } catch (err) {
+      console.error('[MongoDB Keep-Alive] Failed to ping MongoDB:', err);
+    }
+  }, intervalMs);
+}
+
