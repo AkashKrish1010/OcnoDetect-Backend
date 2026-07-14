@@ -10,7 +10,7 @@ import path from 'path';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { rateLimit } from 'express-rate-limit';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import { connectDatabase, User, Case, SavedCase, ChatSession as ChatSessionModel, PasswordResetOtp } from './database';
 
 // Initialize environment variables
@@ -18,6 +18,10 @@ dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 5000;
+
+// Trust the first proxy hop — required for Render/Heroku/Vercel deployments
+// so that express-rate-limit can correctly read the real client IP from X-Forwarded-For
+app.set('trust proxy', 1);
 
 // Enable CORS and JSON parsing
 app.use(cors());
@@ -252,14 +256,9 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Pr
   }
 });
 
-// ─── NODEMAILER TRANSPORTER ──────────────────────────────────────────────────
-const emailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+// ─── RESEND EMAIL CLIENT ──────────────────────────────────────────────────
+// Resend uses HTTP API instead of SMTP — works on all hosting platforms including Render free tier
+const resend = new Resend(process.env.RESEND_API_KEY || '');
 
 // ─── FORGOT PASSWORD ENDPOINTS ────────────────────────────────────────────────
 
@@ -290,9 +289,9 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     await PasswordResetOtp.deleteMany({ email: emailLower });
     await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
 
-    // Send OTP via Gmail
-    await emailTransporter.sendMail({
-      from: `"OcnoDetect" <${process.env.EMAIL_USER}>`,
+    // Send OTP via Resend (HTTP API — works on Render)
+    await resend.emails.send({
+      from: 'OcnoDetect <onboarding@resend.dev>',
       to: emailLower,
       subject: 'Your OcnoDetect Password Reset OTP',
       html: `
