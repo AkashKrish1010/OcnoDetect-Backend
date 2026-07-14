@@ -290,7 +290,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
 
     // Send OTP via Resend (HTTP API — works on Render)
-    await resend.emails.send({
+    const { data, error } = await resend.emails.send({
       from: 'OcnoDetect <onboarding@resend.dev>',
       to: emailLower,
       subject: 'Your OcnoDetect Password Reset OTP',
@@ -340,11 +340,16 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
       `,
     });
 
+    if (error) {
+      console.error(`[Resend Error] Failed to send email to ${emailLower}:`, error);
+      throw new Error(error.message || 'Resend API failed to deliver email.');
+    }
+
     console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
     res.json({ success: true, message: 'If this email is registered, an OTP has been sent.' });
   } catch (err: any) {
     console.error('Error in /api/auth/forgot-password:', err);
-    res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+    res.status(500).json({ error: err.message || 'Failed to send OTP email. Please try again.' });
   }
 });
 
