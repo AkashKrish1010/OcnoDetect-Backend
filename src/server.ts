@@ -346,7 +346,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     });
 
     if (!brevoResponse.ok) {
-      const errDetail = await brevoResponse.json().catch(() => ({}));
+      const errDetail: any = await brevoResponse.json().catch(() => ({}));
       console.error('[Brevo Error] Failed to send email:', errDetail);
       throw new Error(errDetail.message || 'Brevo API failed to deliver email.');
     }
