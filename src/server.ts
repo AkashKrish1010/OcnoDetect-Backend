@@ -4,11 +4,14 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import dotenv from 'dotenv';
 import Groq from 'groq-sdk';
+import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import path from 'path';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { connectDatabase, User, Case, SavedCase, ChatSession as ChatSessionModel } from './database';
+import { rateLimit } from 'express-rate-limit';
+import nodemailer from 'nodemailer';
+import { connectDatabase, User, Case, SavedCase, ChatSession as ChatSessionModel, PasswordResetOtp } from './database';
 
 // Initialize environment variables
 dotenv.config();
@@ -19,6 +22,54 @@ const port = process.env.PORT || 5000;
 // Enable CORS and JSON parsing
 app.use(cors());
 app.use(express.json());
+
+// Define Rate Limiters to secure API endpoints against brute force and API abuse
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: {
+    error: 'Too many requests from this IP, please try again after 15 minutes.'
+  }
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 15, // Limit each IP to 15 login/register attempts per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many login or registration attempts. Please try again after 15 minutes.'
+  }
+});
+
+// Global minute-based AI rate limiter to protect the upstream 15 RPM limit (Gemini Studio / Groq key bottleneck)
+const aiMinutlyLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 15, // Max 15 requests per minute globally
+  keyGenerator: (req) => 'global_ai_minutly', // Applies globally across all users/IPs to prevent key suspension
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'AI service rate limit reached (15 RPM). Please wait a moment before trying again.'
+  }
+});
+
+// Global daily AI rate limiter to protect the upstream 500 RPD limit (Gemini Studio bottleneck)
+const aiDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: 500, // Max 500 requests per day globally
+  keyGenerator: (req) => 'global_ai_daily', // Applies globally across all users/IPs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Daily AI query quota reached (500 RPD). Please try again tomorrow.'
+  }
+});
+
+// Apply the general rate limiter to all API endpoints
+app.use('/api/', generalLimiter);
 
 // Set up Multer for handling file uploads (stored in memory)
 // Enforces a strict 10MB limit to prevent memory exhaustion from large scans
@@ -33,14 +84,21 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY || '',
 });
 
+// Initialize Gemini SDK
+const geminiApiKey = process.env.GEMINI_API_KEY || '';
+const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+
 // Helper: safe JSON extraction from model response
 function extractJSON(text: string): any {
   try {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+      // Clean up trailing commas in arrays/objects to prevent parsing errors
+      const cleaned = jsonMatch[0].replace(/,\s*([\]}])/g, '$1');
+      return JSON.parse(cleaned);
     }
-    return JSON.parse(text);
+    const cleanedText = text.replace(/,\s*([\]}])/g, '$1');
+    return JSON.parse(cleanedText);
   } catch (err) {
     console.error('Failed to parse JSON directly. Raw response:', text);
     throw new Error('AI response did not contain valid structured JSON data.');
@@ -86,7 +144,7 @@ export function authenticateToken(req: AuthRequest, res: Response, next: NextFun
  * POST /api/auth/register
  * Registers a new clinician account with a hashed password. Returns a JWT.
  */
-app.post('/api/auth/register', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/auth/register', authLimiter, async (req: Request, res: Response): Promise<any> => {
   try {
     const { name, email, password, specialty, institution } = req.body;
 
@@ -152,7 +210,7 @@ app.post('/api/auth/register', async (req: Request, res: Response): Promise<any>
  * POST /api/auth/login
  * Authenticates clinician credentials. Returns a JWT.
  */
-app.post('/api/auth/login', async (req: Request, res: Response): Promise<any> => {
+app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Promise<any> => {
   try {
     const { email, password } = req.body;
 
@@ -191,6 +249,184 @@ app.post('/api/auth/login', async (req: Request, res: Response): Promise<any> =>
   } catch (err: any) {
     console.error('Error in /api/auth/login:', err);
     res.status(500).json({ error: 'Internal server error during login.' });
+  }
+});
+
+// ─── NODEMAILER TRANSPORTER ──────────────────────────────────────────────────
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// ─── FORGOT PASSWORD ENDPOINTS ────────────────────────────────────────────────
+
+/**
+ * POST /api/auth/forgot-password
+ * Generates a 6-digit OTP, saves it to DB (expires 10 min), emails it to the clinician.
+ */
+app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required.' });
+    }
+
+    const emailLower = email.trim().toLowerCase();
+    const user = await User.findOne({ email: emailLower });
+
+    // Always return success to avoid user enumeration — don't reveal if email exists
+    if (!user) {
+      return res.json({ success: true, message: 'If this email is registered, an OTP has been sent.' });
+    }
+
+    // Generate a 6-digit OTP
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Delete any existing OTP for this email, then save the new one
+    await PasswordResetOtp.deleteMany({ email: emailLower });
+    await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
+
+    // Send OTP via Gmail
+    await emailTransporter.sendMail({
+      from: `"OcnoDetect" <${process.env.EMAIL_USER}>`,
+      to: emailLower,
+      subject: 'Your OcnoDetect Password Reset OTP',
+      html: `
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
+          
+          <!-- Header -->
+          <div style="background: #0ea5e9; padding: 28px 32px; text-align: center;">
+            <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">
+              Ocno<span style="color: #bae6fd;">Detect</span>
+            </span>
+            <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0; font-weight: 400;">Clinical Intelligence Platform</p>
+          </div>
+
+          <!-- Body -->
+          <div style="padding: 32px;">
+            <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin: 0 0 8px 0;">Password Reset Request</h2>
+            <p style="color: #64748b; font-size: 14px; line-height: 22px; margin: 0 0 28px 0;">
+              We received a request to reset your OcnoDetect account password. Use the one-time code below. It expires in <strong style="color: #0f172a;">10 minutes</strong>.
+            </p>
+
+            <!-- OTP Box -->
+            <div style="background: #f0f9ff; border: 2px solid #0ea5e9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 28px;">
+              <p style="color: #0ea5e9; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 12px 0;">Your OTP Code</p>
+              <div style="font-size: 40px; font-weight: 800; color: #0f172a; letter-spacing: 12px; font-variant-numeric: tabular-nums;">${otp}</div>
+            </div>
+
+            <!-- Warning -->
+            <div style="background: #fefce8; border-left: 3px solid #eab308; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
+              <p style="color: #713f12; font-size: 13px; margin: 0; line-height: 20px;">
+                ⚠️ If you did not request this, please ignore this email. Your password will remain unchanged.
+              </p>
+            </div>
+
+            <p style="color: #94a3b8; font-size: 12px; margin: 0; line-height: 18px;">
+              This code is valid for a single use only and will expire after 10 minutes.
+            </p>
+          </div>
+
+          <!-- Footer -->
+          <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
+            <p style="color: #94a3b8; font-size: 12px; margin: 0;">© 2026 OcnoDetect · Clinical Intelligence Platform</p>
+            <p style="color: #cbd5e1; font-size: 11px; margin: 4px 0 0 0;">Do not reply to this email · This is an automated message</p>
+          </div>
+
+        </div>
+      `,
+    });
+
+    console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
+    res.json({ success: true, message: 'If this email is registered, an OTP has been sent.' });
+  } catch (err: any) {
+    console.error('Error in /api/auth/forgot-password:', err);
+    res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+  }
+});
+
+/**
+ * POST /api/auth/verify-otp
+ * Verifies the 6-digit OTP is correct and not expired.
+ */
+app.post('/api/auth/verify-otp', authLimiter, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'Email and OTP are required.' });
+    }
+
+    const emailLower = email.trim().toLowerCase();
+    const record = await PasswordResetOtp.findOne({ email: emailLower });
+
+    if (!record) {
+      return res.status(400).json({ error: 'OTP not found or already used. Please request a new one.' });
+    }
+
+    if (new Date() > record.expiresAt) {
+      await PasswordResetOtp.deleteMany({ email: emailLower });
+      return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+    }
+
+    if (record.otp !== otp.trim()) {
+      return res.status(400).json({ error: 'Incorrect OTP. Please check and try again.' });
+    }
+
+    console.log(`[Auth] OTP verified successfully for: ${emailLower}`);
+    res.json({ success: true, message: 'OTP verified successfully.' });
+  } catch (err: any) {
+    console.error('Error in /api/auth/verify-otp:', err);
+    res.status(500).json({ error: 'Internal server error during OTP verification.' });
+  }
+});
+
+/**
+ * POST /api/auth/reset-password
+ * Verifies OTP once more then updates the clinician's hashed password and deletes the OTP.
+ */
+app.post('/api/auth/reset-password', authLimiter, async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ error: 'Email, OTP, and new password are required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    }
+
+    const emailLower = email.trim().toLowerCase();
+    const record = await PasswordResetOtp.findOne({ email: emailLower });
+
+    if (!record) {
+      return res.status(400).json({ error: 'OTP not found or already used. Please request a new one.' });
+    }
+
+    if (new Date() > record.expiresAt) {
+      await PasswordResetOtp.deleteMany({ email: emailLower });
+      return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+    }
+
+    if (record.otp !== otp.trim()) {
+      return res.status(400).json({ error: 'Incorrect OTP. Cannot reset password.' });
+    }
+
+    // Hash the new password and update the user
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await User.updateOne({ email: emailLower }, { password: hashedPassword });
+
+    // Invalidate OTP immediately after use
+    await PasswordResetOtp.deleteMany({ email: emailLower });
+
+    console.log(`[Auth] Password reset successfully for: ${emailLower}`);
+    res.json({ success: true, message: 'Password reset successfully. You can now log in.' });
+  } catch (err: any) {
+    console.error('Error in /api/auth/reset-password:', err);
+    res.status(500).json({ error: 'Internal server error during password reset.' });
   }
 });
 
@@ -370,7 +606,7 @@ app.post('/api/clear-cases', authenticateToken as any, async (req: AuthRequest, 
  * Analyzes pathology report (PDF) or CT scan metadata.
  * Saves the generated case summary prefixed with the user's ID.
  */
-app.post('/api/upload', authenticateToken as any, (req: AuthRequest, res: Response, next: NextFunction) => {
+app.post('/api/upload', aiDailyLimiter, aiMinutlyLimiter, authenticateToken as any, (req: AuthRequest, res: Response, next: NextFunction) => {
   upload.single('file')(req as any, res as any, (err: any) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
@@ -414,22 +650,23 @@ app.post('/api/upload', authenticateToken as any, (req: AuthRequest, res: Respon
       return res.status(400).json({ error: 'No report text or file content found to analyze.' });
     }
 
-    console.log(`Generating AI clinical summary via Groq for user ${userId}...`);
+    console.log(`Generating AI clinical summary via Groq/Gemini for user ${userId}...`);
 
-    const systemPrompt = `first analyze and tell if valid if invalid return just invalid
+    const systemPrompt = `first analyze and tell if valid. If invalid, you MUST return a JSON object with: { "isValid": false, "error": "invalid" }
 
 You are an expert AI clinical decision support system for head and neck oncology surgeons.
 Your task is to analyze pathology reports, pathology details, or clinical scans (images) of a head/neck cancer patient and synthesize an extremely comprehensive, detailed, and high-yield structured clinical summary in JSON format.
 You must output extensive, comprehensive clinical descriptions with absolute specificity, leaving out no diagnostic indicators.
 
 Validation Check Rules:
-- If analyzing text, verify if it contains relevant medical, clinical, or oncological details. If the text does not contain relevant oncological or medical details, it is invalid and you MUST return only the string "invalid".
-- If analyzing an image, verify if the image is a valid medical scan (such as a CT scan, MRI scan, X-ray, PET scan, pathology slide, or DICOM slice). If the image is NOT a medical scan (for example, if it is a photo of a pet, a person, a landscape, a building, a UI mockup, or generic drawings), it is invalid and you MUST return only the string "invalid".
+- If analyzing text, verify if it contains relevant medical, clinical, or oncological details. If the text does not contain relevant oncological or medical details, it is invalid and you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.
+- If analyzing an image, verify if the image is a valid medical scan (such as a CT scan, MRI scan, X-ray, PET scan, pathology slide, or DICOM slice). If the image is NOT a medical scan (for example, if it is a photo of a pet, a person, a landscape, a building, a UI mockup, or generic drawings), it is invalid and you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.
 
 If the input is valid, you MUST return a JSON object matching this schema exactly:
 {
   "isValid": true,
   "patientId": "string (extract from report or generate a realistic one like PT-2024-XXXX)",
+  "confidence": 0.95, // (number: float between 0.0 and 1.0 representing your diagnostic confidence of the site and staging)
   "site": "string (detected primary site, e.g. Base of Tongue, Larynx, Oral Tongue, Tonsil, Oropharynx)",
   "findings": [
     "detailed primary tumor dimensions (e.g., 3.4 x 2.8 x 1.5 cm) and specific pathologic features (e.g., degree of keratinization, surface ulceration, exact depth of invasion (DOI) in millimeters, perineural invasion (PNI), lymphovascular invasion (LVI), bone/mandibular cortex invasion, and deep skeletal muscle infiltration)",
@@ -466,69 +703,109 @@ Crucial Guidelines:
 1. Be highly concise, focused, and high-yield. Do NOT write overly long or verbose paragraphs. Each item in the "findings", "surgicalConsiderations", "prognosticFactors", and "multidisciplinaryRecommendations" arrays should be a concise, information-dense clinical description (around 1-2 precise sentences) containing the exact measurements, specific structures, and clear clinical justifications without unnecessary wordiness or fluff.
 2. In surgicalConsiderations, provide focused surgical details (specific neck levels, flap choice, and airway management) in a concise manner.
 3. Under findings, include the clinician disclaimer: "AI-generated summary. Final clinical responsibility remains with the surgeon." as the last item.
-4. Do not add any introductory or concluding text, or markdown code block markers. Return ONLY the raw JSON.`;
+4. Do not add any introductory or concluding text, or markdown code block markers. Return ONLY the raw JSON.
+5. DO NOT copy or default to the placeholder examples mentioned in the schema instructions (such as the ID "PT-2024-XXXX", dimensions like "3.4 x 2.8 x 1.5 cm", node size "4.2 cm", margins "1.8 mm / 4 mm", staging "T3N2bM0", or site "Oropharynx"). You must dynamically generate clinical values, measurements, staging, and site names that are specific and custom-synthesized for the provided patient data.`;
 
-    let response;
+    let structuredSummary: any;
+    let textResponse = '';
+
     if (isImage) {
-      const dataUrl = `data:${mimeType};base64,${base64Image}`;
-      console.log(`Analyzing image via Groq Vision Model (meta-llama/llama-4-scout-17b-16e-instruct) for user ${userId}...`);
-      response = await groq.chat.completions.create({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          {
-            role: 'user',
-            content: [
+      let geminiSuccess = false;
+      if (ai) {
+        try {
+          console.log(`Analyzing image via Gemini Model (gemini-3.1-flash-lite) for user ${userId}...`);
+          const geminiResponse = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite',
+            contents: [
               {
-                type: 'text',
-                text: `Patient report / scan details. This is an uploaded image file (${fileName}). First analyze and tell if valid. If it is NOT a valid medical scan (like a CT scan or MRI scan), you MUST return only the string "invalid". If it is a valid scan, describe the anatomical findings, tumor dimensions, and staging details you see.${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`
-              },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: dataUrl
+                inlineData: {
+                  mimeType: mimeType,
+                  data: base64Image
                 }
-              }
-            ]
+              },
+              { text: systemPrompt },
+              { text: `Patient report / scan details. This is an uploaded image file (${fileName}). First analyze and tell if valid. If it is NOT a valid medical scan (like a CT scan or MRI scan), you MUST return a JSON object with: { "isValid": false, "error": "invalid" }. If it is a valid scan, describe the anatomical findings, tumor dimensions, and staging details you see.${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
+            ],
+            config: {
+              responseMimeType: "application/json"
+            }
+          });
+          textResponse = geminiResponse.text || '';
+          console.log(`Gemini response received.`);
+
+          const cleanedResponse = textResponse.trim().toLowerCase();
+          if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+            console.log(`[Validation Error] Gemini returned invalid. Upload rejected.`);
+            return res.status(400).json({
+              error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+            });
           }
-        ] as any,
-        temperature: 0.1,
-      });
+
+          structuredSummary = extractJSON(textResponse);
+          geminiSuccess = true;
+        } catch (geminiErr: any) {
+          console.warn(`Gemini Vision analysis failed, falling back to Groq:`, geminiErr);
+        }
+      }
+
+      if (!geminiSuccess) {
+        console.log(`Analyzing image via Groq Vision Model (meta-llama/llama-4-scout-17b-16e-instruct) for user ${userId}...`);
+        const dataUrl = `data:${mimeType};base64,${base64Image}`;
+        const groqResponse = await groq.chat.completions.create({
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          response_format: { type: "json_object" },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: `Patient report / scan details. This is an uploaded image file (${fileName}). First analyze and tell if valid. If it is NOT a valid medical scan (like a CT scan or MRI scan), you MUST return a JSON object with: { "isValid": false, "error": "invalid" }. If it is a valid scan, describe the anatomical findings, tumor dimensions, and staging details you see.${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: dataUrl
+                  }
+                }
+              ]
+            }
+          ] as any,
+          temperature: 0.1,
+        });
+
+        textResponse = groqResponse.choices[0]?.message?.content || '';
+        const cleanedResponse = textResponse.trim().toLowerCase();
+        if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+          console.log(`[Validation Error] Groq returned invalid. Upload rejected.`);
+          return res.status(400).json({
+            error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+          });
+        }
+        structuredSummary = extractJSON(textResponse);
+      }
     } else {
       console.log(`Generating AI clinical summary via Groq Llama-3.3 for user ${userId}...`);
-      response = await groq.chat.completions.create({
+      const groqResponse = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
+        response_format: { type: "json_object" },
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return only the string "invalid".\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
+          { role: 'user', content: `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
         ],
         temperature: 0.1,
       });
-    }
 
-    const textResponse = response.choices[0]?.message?.content || '';
-
-    // Check if the AI returned invalid
-    const cleanedResponse = textResponse.trim().toLowerCase();
-    if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
-      console.log(`[Validation Error] AI returned invalid. Upload rejected.`);
-      return res.status(400).json({
-        error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
-      });
-    }
-
-    let structuredSummary;
-    try {
-      structuredSummary = extractJSON(textResponse);
-    } catch (parseError: any) {
-      // Defensive fallback check
-      if (cleanedResponse.includes('invalid')) {
-        console.log(`[Validation Error] Parse failed but response indicates invalid.`);
+      textResponse = groqResponse.choices[0]?.message?.content || '';
+      const cleanedResponse = textResponse.trim().toLowerCase();
+      if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+        console.log(`[Validation Error] AI returned invalid. Upload rejected.`);
         return res.status(400).json({
           error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
         });
       }
-      throw parseError;
+      structuredSummary = extractJSON(textResponse);
     }
 
     // Validate report/scan correctness before proceeding
@@ -538,7 +815,10 @@ Crucial Guidelines:
     }
 
     // Bind this case context explicitly to the active surgeon's userId!
-    const confidenceVal = structuredSummary.confidence || 0.92;
+    const rawConfidence = typeof structuredSummary.confidence === 'number'
+      ? structuredSummary.confidence
+      : parseFloat(structuredSummary.confidence);
+    const confidenceVal = isNaN(rawConfidence) ? 1.0 : rawConfidence;
     const dateVal = 'Today, ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     const dynamicCase = new Case({
@@ -579,7 +859,7 @@ Crucial Guidelines:
  * POST /api/chat
  * Answers dynamic patient queries anchored entirely on the generated Case Context.
  */
-app.post('/api/chat', authenticateToken as any, async (req: AuthRequest, res: Response): Promise<any> => {
+app.post('/api/chat', aiDailyLimiter, aiMinutlyLimiter, authenticateToken as any, async (req: AuthRequest, res: Response): Promise<any> => {
   try {
     const { message, history, caseContext } = req.body;
 
@@ -638,7 +918,7 @@ Your Absolute Rules:
  * POST /api/reference
  * Auto-populates case-specific guidelines and queries PubMed-grade research papers.
  */
-app.post('/api/reference', authenticateToken as any, async (req: AuthRequest, res: Response): Promise<any> => {
+app.post('/api/reference', aiDailyLimiter, aiMinutlyLimiter, authenticateToken as any, async (req: AuthRequest, res: Response): Promise<any> => {
   try {
     const userId = req.user?.id || '';
     const { caseContext } = req.body;
@@ -695,6 +975,7 @@ Ensure the output is 100% valid JSON. Do not add markdown backticks or other tex
 
     const response = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
+      response_format: { type: "json_object" },
       messages: [{ role: 'user', content: systemPrompt }],
       temperature: 0.2,
     });
@@ -887,5 +1168,7 @@ app.delete('/api/chat-sessions/:sessionId', authenticateToken as any, async (req
 app.listen(port, () => {
   console.log(`====================================================`);
   console.log(`ScanWise AI backend server running on port ${port}`);
+  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq (meta-llama/llama-4-scout-17b-16e-instruct)'}`);
+  console.log(`[AI Configuration] Primary Text: Groq Llama-3.3 (llama-3.3-70b-versatile)`);
   console.log(`====================================================`);
 });

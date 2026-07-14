@@ -133,6 +133,22 @@ ChatSessionSchema.index({ userId: 1, updatedAt: -1 });
 ChatSessionSchema.index({ userId: 1, sessionId: 1 }, { unique: true });
 export const ChatSession = mongoose.model<IChatSession>('ChatSession', ChatSessionSchema);
 
+// ─── PASSWORD RESET OTP SCHEMA ────────────────────────────────────────────
+export interface IPasswordResetOtp extends Document {
+  email: string;
+  otp: string;
+  expiresAt: Date;
+}
+
+const PasswordResetOtpSchema: Schema = new Schema({
+  email: { type: String, required: true, lowercase: true, trim: true },
+  otp: { type: String, required: true },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } }, // TTL index — auto-deletes after expiry
+});
+
+PasswordResetOtpSchema.index({ email: 1 });
+export const PasswordResetOtp = mongoose.model<IPasswordResetOtp>('PasswordResetOtp', PasswordResetOtpSchema);
+
 // ─── DATABASE INITIALIZATION ──────────────────────────────────────────────
 export async function connectDatabase() {
   const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/ocnodetect';
