@@ -10,7 +10,6 @@ import path from 'path';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { rateLimit } from 'express-rate-limit';
-import { Resend } from 'resend';
 import { connectDatabase, User, Case, SavedCase, ChatSession as ChatSessionModel, PasswordResetOtp } from './database';
 
 // Initialize environment variables
@@ -256,9 +255,7 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Pr
   }
 });
 
-// ─── RESEND EMAIL CLIENT ──────────────────────────────────────────────────
-// Resend uses HTTP API instead of SMTP — works on all hosting platforms including Render free tier
-const resend = new Resend(process.env.RESEND_API_KEY || '');
+
 
 // ─── FORGOT PASSWORD ENDPOINTS ────────────────────────────────────────────────
 
@@ -289,60 +286,69 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     await PasswordResetOtp.deleteMany({ email: emailLower });
     await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
 
-    // Send OTP via Resend (HTTP API — works on Render)
-    const { data, error } = await resend.emails.send({
-      from: 'OcnoDetect <onboarding@resend.dev>',
-      to: emailLower,
-      subject: 'Your OcnoDetect Password Reset OTP',
-      html: `
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
-          
-          <!-- Header -->
-          <div style="background: #0ea5e9; padding: 28px 32px; text-align: center;">
-            <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">
-              Ocno<span style="color: #bae6fd;">Detect</span>
-            </span>
-            <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0; font-weight: 400;">Clinical Intelligence Platform</p>
-          </div>
-
-          <!-- Body -->
-          <div style="padding: 32px;">
-            <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin: 0 0 8px 0;">Password Reset Request</h2>
-            <p style="color: #64748b; font-size: 14px; line-height: 22px; margin: 0 0 28px 0;">
-              We received a request to reset your OcnoDetect account password. Use the one-time code below. It expires in <strong style="color: #0f172a;">10 minutes</strong>.
-            </p>
-
-            <!-- OTP Box -->
-            <div style="background: #f0f9ff; border: 2px solid #0ea5e9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 28px;">
-              <p style="color: #0ea5e9; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 12px 0;">Your OTP Code</p>
-              <div style="font-size: 40px; font-weight: 800; color: #0f172a; letter-spacing: 12px; font-variant-numeric: tabular-nums;">${otp}</div>
+    // Send OTP via Brevo API (HTTP — works on Render without domain restrictions)
+    const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': process.env.BREVO_API_KEY || '',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sender: { name: 'OcnoDetect', email: 'aksharaa653@gmail.com' },
+        to: [{ email: emailLower }],
+        subject: 'Your OcnoDetect Password Reset OTP',
+        htmlContent: `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
+            
+            <!-- Header -->
+            <div style="background: #0ea5e9; padding: 28px 32px; text-align: center;">
+              <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">
+                Ocno<span style="color: #bae6fd;">Detect</span>
+              </span>
+              <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0; font-weight: 400;">Clinical Intelligence Platform</p>
             </div>
 
-            <!-- Warning -->
-            <div style="background: #fefce8; border-left: 3px solid #eab308; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
-              <p style="color: #713f12; font-size: 13px; margin: 0; line-height: 20px;">
-                ⚠️ If you did not request this, please ignore this email. Your password will remain unchanged.
+            <!-- Body -->
+            <div style="padding: 32px;">
+              <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin: 0 0 8px 0;">Password Reset Request</h2>
+              <p style="color: #64748b; font-size: 14px; line-height: 22px; margin: 0 0 28px 0;">
+                We received a request to reset your OcnoDetect account password. Use the one-time code below. It expires in <strong style="color: #0f172a;">10 minutes</strong>.
+              </p>
+
+              <!-- OTP Box -->
+              <div style="background: #f0f9ff; border: 2px solid #0ea5e9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 28px;">
+                <p style="color: #0ea5e9; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 12px 0;">Your OTP Code</p>
+                <div style="font-size: 40px; font-weight: 800; color: #0f172a; letter-spacing: 12px; font-variant-numeric: tabular-nums;">${otp}</div>
+              </div>
+
+              <!-- Warning -->
+              <div style="background: #fefce8; border-left: 3px solid #eab308; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
+                <p style="color: #713f12; font-size: 13px; margin: 0; line-height: 20px;">
+                  ⚠️ If you did not request this, please ignore this email. Your password will remain unchanged.
+                </p>
+              </div>
+
+              <p style="color: #94a3b8; font-size: 12px; margin: 0; line-height: 18px;">
+                This code is valid for a single use only and will expire after 10 minutes.
               </p>
             </div>
 
-            <p style="color: #94a3b8; font-size: 12px; margin: 0; line-height: 18px;">
-              This code is valid for a single use only and will expire after 10 minutes.
-            </p>
-          </div>
+            <!-- Footer -->
+            <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
+              <p style="color: #94a3b8; font-size: 12px; margin: 0;">© 2026 OcnoDetect · Clinical Intelligence Platform</p>
+              <p style="color: #cbd5e1; font-size: 11px; margin: 4px 0 0 0;">Do not reply to this email · This is an automated message</p>
+            </div>
 
-          <!-- Footer -->
-          <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
-            <p style="color: #94a3b8; font-size: 12px; margin: 0;">© 2026 OcnoDetect · Clinical Intelligence Platform</p>
-            <p style="color: #cbd5e1; font-size: 11px; margin: 4px 0 0 0;">Do not reply to this email · This is an automated message</p>
           </div>
-
-        </div>
-      `,
+        `
+      })
     });
 
-    if (error) {
-      console.error(`[Resend Error] Failed to send email to ${emailLower}:`, error);
-      throw new Error(error.message || 'Resend API failed to deliver email.');
+    if (!brevoResponse.ok) {
+      const errDetail = await brevoResponse.json().catch(() => ({}));
+      console.error('[Brevo Error] Failed to send email:', errDetail);
+      throw new Error(errDetail.message || 'Brevo API failed to deliver email.');
     }
 
     console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
