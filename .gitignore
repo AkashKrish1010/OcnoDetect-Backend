@@ -16,3 +16,6 @@ db.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Google OAuth2 client secret files (never commit these)
+client_secret*.json

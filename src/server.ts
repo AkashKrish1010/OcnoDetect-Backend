@@ -254,12 +254,17 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Pr
     console.error('Error in /api/auth/login:', err);
     res.status(500).json({ error: 'Internal server error during login.' });
   }
-});// ─── NODEMAILER TRANSPORTER ──────────────────────────────────────────────────
+
+// ─── NODEMAILER TRANSPORTER (Gmail OAuth2) ───────────────────────────────────
+// Uses OAuth2 instead of App Password — works on Railway/Render (HTTP, not SMTP port)
 const emailTransporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
+    type: 'OAuth2',
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
+    clientId: process.env.GMAIL_CLIENT_ID,
+    clientSecret: process.env.GMAIL_CLIENT_SECRET,
+    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
   },
 });
 
