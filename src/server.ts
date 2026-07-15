@@ -10,7 +10,6 @@ import path from 'path';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { rateLimit } from 'express-rate-limit';
-import nodemailer from 'nodemailer';
 import { connectDatabase, User, Case, SavedCase, ChatSession as ChatSessionModel, PasswordResetOtp } from './database';
 
 // Initialize environment variables
@@ -256,18 +255,47 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Pr
   }
 });
 
-// ─── NODEMAILER TRANSPORTER (Gmail OAuth2) ───────────────────────────────────
-// Uses OAuth2 instead of App Password — works on Railway/Render (HTTP, not SMTP port)
-const emailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    type: 'OAuth2',
-    user: process.env.EMAIL_USER,
-    clientId: process.env.GMAIL_CLIENT_ID,
-    clientSecret: process.env.GMAIL_CLIENT_SECRET,
-    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
-  },
-});
+// ─── GMAIL REST API HELPERS ──────────────────────────────────────────────────
+// Pure HTTPS (port 443) — no SMTP — works on Railway & Render
+
+async function getGmailAccessToken(): Promise<string> {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id:     process.env.GMAIL_CLIENT_ID     || '',
+      client_secret: process.env.GMAIL_CLIENT_SECRET || '',
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN || '',
+      grant_type:    'refresh_token',
+    }),
+  });
+  const data: any = await res.json();
+  if (!data.access_token) throw new Error(`Gmail OAuth token error: ${JSON.stringify(data)}`);
+  return data.access_token;
+}
+
+async function sendGmailEmail(to: string, subject: string, htmlBody: string): Promise<void> {
+  const accessToken = await getGmailAccessToken();
+  const rawMessage = [
+    `From: OcnoDetect <${process.env.EMAIL_USER}>`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: text/html; charset=utf-8`,
+    ``,
+    htmlBody,
+  ].join('\r\n');
+  const encoded = Buffer.from(rawMessage).toString('base64url');
+  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ raw: encoded }),
+  });
+  if (!res.ok) {
+    const err: any = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Gmail API send failed (${res.status})`);
+  }
+}
 
 // ─── FORGOT PASSWORD ENDPOINTS ────────────────────────────────────────────────
 
@@ -298,56 +326,33 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     await PasswordResetOtp.deleteMany({ email: emailLower });
     await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
 
-    // Send OTP via Gmail SMTP (works on Railway)
-    await emailTransporter.sendMail({
-      from: `"OcnoDetect" <${process.env.EMAIL_USER}>`,
-      to: emailLower,
-      subject: 'Your OcnoDetect Password Reset OTP',
-      html: `
-        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
-          
-          <!-- Header -->
+    // Send OTP via Gmail REST API (pure HTTPS — not SMTP, works on Railway)
+    await sendGmailEmail(
+      emailLower,
+      'Your OcnoDetect Password Reset OTP',
+      `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
           <div style="background: #0ea5e9; padding: 28px 32px; text-align: center;">
-            <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">
-              Ocno<span style="color: #bae6fd;">Detect</span>
-            </span>
-            <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0; font-weight: 400;">Clinical Intelligence Platform</p>
+            <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">Ocno<span style="color: #bae6fd;">Detect</span></span>
+            <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0;">Clinical Intelligence Platform</p>
           </div>
-
-          <!-- Body -->
           <div style="padding: 32px;">
             <h2 style="color: #0f172a; font-size: 20px; font-weight: 700; margin: 0 0 8px 0;">Password Reset Request</h2>
-            <p style="color: #64748b; font-size: 14px; line-height: 22px; margin: 0 0 28px 0;">
-              We received a request to reset your OcnoDetect account password. Use the one-time code below. It expires in <strong style="color: #0f172a;">10 minutes</strong>.
-            </p>
-
-            <!-- OTP Box -->
+            <p style="color: #64748b; font-size: 14px; line-height: 22px; margin: 0 0 28px 0;">We received a request to reset your OcnoDetect account password. Use the one-time code below. It expires in <strong style="color: #0f172a;">10 minutes</strong>.</p>
             <div style="background: #f0f9ff; border: 2px solid #0ea5e9; border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 28px;">
               <p style="color: #0ea5e9; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 12px 0;">Your OTP Code</p>
-              <div style="font-size: 40px; font-weight: 800; color: #0f172a; letter-spacing: 12px; font-variant-numeric: tabular-nums;">${otp}</div>
+              <div style="font-size: 40px; font-weight: 800; color: #0f172a; letter-spacing: 12px;">${otp}</div>
             </div>
-
-            <!-- Warning -->
             <div style="background: #fefce8; border-left: 3px solid #eab308; border-radius: 6px; padding: 12px 16px; margin-bottom: 24px;">
-              <p style="color: #713f12; font-size: 13px; margin: 0; line-height: 20px;">
-                ⚠️ If you did not request this, please ignore this email. Your password will remain unchanged.
-              </p>
+              <p style="color: #713f12; font-size: 13px; margin: 0;">⚠️ If you did not request this, ignore this email. Your password will remain unchanged.</p>
             </div>
-
-            <p style="color: #94a3b8; font-size: 12px; margin: 0; line-height: 18px;">
-              This code is valid for a single use only and will expire after 10 minutes.
-            </p>
+            <p style="color: #94a3b8; font-size: 12px; margin: 0;">This code is valid for a single use only and will expire after 10 minutes.</p>
           </div>
-
-          <!-- Footer -->
           <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 20px 32px; text-align: center;">
             <p style="color: #94a3b8; font-size: 12px; margin: 0;">© 2026 OcnoDetect · Clinical Intelligence Platform</p>
             <p style="color: #cbd5e1; font-size: 11px; margin: 4px 0 0 0;">Do not reply to this email · This is an automated message</p>
           </div>
-
-        </div>
-      `,
-    });
+        </div>`
+    );
 
     console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
     res.json({ success: true, message: 'If this email is registered, an OTP has been sent.' });
