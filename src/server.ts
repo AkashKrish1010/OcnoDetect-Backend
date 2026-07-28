@@ -794,10 +794,10 @@ Crucial Guidelines:
       }
 
       if (!geminiSuccess) {
-        console.log(`Analyzing image via Groq Vision Model (llama-3.2-11b-vision-preview) for user ${userId}...`);
+        console.log(`Analyzing image via Groq Vision Model (qwen/qwen3.6-27b) for user ${userId}...`);
         const dataUrl = `data:${mimeType};base64,${base64Image}`;
         const groqResponse = await groq.chat.completions.create({
-          model: 'llama-3.2-11b-vision-preview',
+          model: 'qwen/qwen3.6-27b',
           response_format: { type: "json_object" },
           messages: [
             { role: 'system', content: systemPrompt },
@@ -1249,7 +1249,7 @@ app.delete('/api/chat-sessions/:sessionId', authenticateToken as any, async (req
 app.listen(port, () => {
   console.log(`====================================================`);
   console.log(`ScanWise AI backend server running on port ${port}`);
-  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (llama-3.2-11b-vision-preview)'}`);
+  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (qwen/qwen3.6-27b)'}`);
   console.log(`[AI Configuration] Primary Text: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (llama-3.1-8b-instant)'}`);
   console.log(`====================================================`);
 });
