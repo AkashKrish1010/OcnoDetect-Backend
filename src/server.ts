@@ -103,10 +103,10 @@ function extractJSON(text: string): any {
     cleaned = cleaned.replace(/```json/gi, '').replace(/```/g, '').trim();
 
     // 3. Find outermost JSON object boundaries { ... }
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      // Clean up trailing commas in arrays/objects to prevent parsing errors
-      const jsonStr = jsonMatch[0].replace(/,\s*([\]}])/g, '$1');
+    const jsonMatches = cleaned.match(/\{[\s\S]*\}/g);
+    if (jsonMatches && jsonMatches.length > 0) {
+      const lastMatch = jsonMatches[jsonMatches.length - 1];
+      const jsonStr = lastMatch.replace(/,\s*([\]}])/g, '$1');
       return JSON.parse(jsonStr);
     }
     const cleanedText = cleaned.replace(/,\s*([\]}])/g, '$1');
@@ -827,6 +827,7 @@ Crucial Guidelines:
             }
           ] as any,
           temperature: 0.1,
+          max_tokens: 8192,
         });
 
         textResponse = groqResponse.choices[0]?.message?.content || '';
@@ -884,6 +885,7 @@ Crucial Guidelines:
             { role: 'user', content: textPrompt }
           ],
           temperature: 0.1,
+          max_tokens: 8192,
         });
 
         textResponse = groqResponse.choices[0]?.message?.content || '';
