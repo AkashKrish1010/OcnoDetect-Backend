@@ -279,10 +279,10 @@ async function getGmailAccessToken(): Promise<string> {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      client_id:     process.env.GMAIL_CLIENT_ID     || '',
+      client_id: process.env.GMAIL_CLIENT_ID || '',
       client_secret: process.env.GMAIL_CLIENT_SECRET || '',
       refresh_token: process.env.GMAIL_REFRESH_TOKEN || '',
-      grant_type:    'refresh_token',
+      grant_type: 'refresh_token',
     }),
   });
   const data: any = await res.json();
@@ -381,7 +381,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     } catch (emailErr: any) {
       console.error('[Auth] Failed to send OTP email:', emailErr.message);
       // Clean up the OTP so it can't be used without delivery
-      await PasswordResetOtp.deleteMany({ email: emailLower }).catch(() => {});
+      await PasswordResetOtp.deleteMany({ email: emailLower }).catch(() => { });
       return res.status(503).json({
         error: 'Unable to send OTP email at this time. Please try again later or contact support.',
       });
@@ -794,10 +794,10 @@ Crucial Guidelines:
       }
 
       if (!geminiSuccess) {
-        console.log(`Analyzing image via Groq Vision Model (meta-llama/llama-4-scout-17b-16e-instruct) for user ${userId}...`);
+        console.log(`Analyzing image via Groq Vision Model (llama-3.2-11b-vision-preview) for user ${userId}...`);
         const dataUrl = `data:${mimeType};base64,${base64Image}`;
         const groqResponse = await groq.chat.completions.create({
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          model: 'llama-3.2-11b-vision-preview',
           response_format: { type: "json_object" },
           messages: [
             { role: 'system', content: systemPrompt },
@@ -831,26 +831,62 @@ Crucial Guidelines:
         structuredSummary = extractJSON(textResponse);
       }
     } else {
-      console.log(`Generating AI clinical summary via Groq Llama-3.3 for user ${userId}...`);
-      const groqResponse = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        response_format: { type: "json_object" },
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}` }
-        ],
-        temperature: 0.1,
-      });
+      let geminiTextSuccess = false;
+      const textPrompt = `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`;
 
-      textResponse = groqResponse.choices[0]?.message?.content || '';
-      const cleanedResponse = textResponse.trim().toLowerCase();
-      if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
-        console.log(`[Validation Error] AI returned invalid. Upload rejected.`);
-        return res.status(400).json({
-          error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
-        });
+      if (ai) {
+        try {
+          console.log(`Generating AI clinical summary via Gemini Model (gemini-3.1-flash-lite) for user ${userId}...`);
+          const geminiResponse = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite',
+            contents: [
+              { text: systemPrompt },
+              { text: textPrompt }
+            ],
+            config: {
+              responseMimeType: "application/json"
+            }
+          });
+          textResponse = geminiResponse.text || '';
+          console.log(`Gemini response received for text/PDF report.`);
+
+          const cleanedResponse = textResponse.trim().toLowerCase();
+          if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+            console.log(`[Validation Error] Gemini returned invalid. Upload rejected.`);
+            return res.status(400).json({
+              error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+            });
+          }
+
+          structuredSummary = extractJSON(textResponse);
+          geminiTextSuccess = true;
+        } catch (geminiErr: any) {
+          console.warn(`Gemini Text analysis failed, falling back to Groq:`, geminiErr);
+        }
       }
-      structuredSummary = extractJSON(textResponse);
+
+      if (!geminiTextSuccess) {
+        console.log(`Generating AI clinical summary via Groq Llama-3.1-8b-instant for user ${userId}...`);
+        const groqResponse = await groq.chat.completions.create({
+          model: 'llama-3.1-8b-instant',
+          response_format: { type: "json_object" },
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: textPrompt }
+          ],
+          temperature: 0.1,
+        });
+
+        textResponse = groqResponse.choices[0]?.message?.content || '';
+        const cleanedResponse = textResponse.trim().toLowerCase();
+        if (cleanedResponse === 'invalid' || cleanedResponse.startsWith('invalid') || cleanedResponse.includes('"invalid"')) {
+          console.log(`[Validation Error] Groq returned invalid. Upload rejected.`);
+          return res.status(400).json({
+            error: 'Please upload a proper clinical document or medical scan related to head and neck oncology.'
+          });
+        }
+        structuredSummary = extractJSON(textResponse);
+      }
     }
 
     // Validate report/scan correctness before proceeding
@@ -945,7 +981,7 @@ Your Absolute Rules:
     chatMessages.push({ role: 'user', content: message });
 
     const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'llama-3.1-8b-instant',
       messages: chatMessages as any,
       temperature: 0.2,
     });
@@ -1019,7 +1055,7 @@ Your output MUST be a valid JSON object matching this schema exactly:
 Ensure the output is 100% valid JSON. Do not add markdown backticks or other text.`;
 
     const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model: 'llama-3.1-8b-instant',
       response_format: { type: "json_object" },
       messages: [{ role: 'user', content: systemPrompt }],
       temperature: 0.2,
@@ -1213,7 +1249,7 @@ app.delete('/api/chat-sessions/:sessionId', authenticateToken as any, async (req
 app.listen(port, () => {
   console.log(`====================================================`);
   console.log(`ScanWise AI backend server running on port ${port}`);
-  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq (meta-llama/llama-4-scout-17b-16e-instruct)'}`);
-  console.log(`[AI Configuration] Primary Text: Groq Llama-3.3 (llama-3.3-70b-versatile)`);
+  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (llama-3.2-11b-vision-preview)'}`);
+  console.log(`[AI Configuration] Primary Text: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (llama-3.1-8b-instant)'}`);
   console.log(`====================================================`);
 });
