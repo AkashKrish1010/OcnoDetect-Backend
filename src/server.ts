@@ -801,7 +801,6 @@ Crucial Guidelines:
         const dataUrl = `data:${mimeType};base64,${base64Image}`;
         const groqResponse = await groq.chat.completions.create({
           model: 'qwen/qwen3.6-27b',
-          response_format: { type: "json_object" },
           messages: [
             { role: 'system', content: systemPrompt },
             {
@@ -873,7 +872,6 @@ Crucial Guidelines:
         console.log(`Generating AI clinical summary via Groq Llama-3.1-8b-instant for user ${userId}...`);
         const groqResponse = await groq.chat.completions.create({
           model: 'llama-3.1-8b-instant',
-          response_format: { type: "json_object" },
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: textPrompt }
@@ -1060,7 +1058,6 @@ Ensure the output is 100% valid JSON. Do not add markdown backticks or other tex
 
     const response = await groq.chat.completions.create({
       model: 'llama-3.1-8b-instant',
-      response_format: { type: "json_object" },
       messages: [{ role: 'user', content: systemPrompt }],
       temperature: 0.2,
     });
