@@ -258,7 +258,23 @@ app.post('/api/auth/login', authLimiter, async (req: Request, res: Response): Pr
 // ─── GMAIL REST API HELPERS ──────────────────────────────────────────────────
 // Pure HTTPS (port 443) — no SMTP — works on Railway & Render
 
+// Warn on startup if Gmail credentials are missing — check Railway environment variables
+const GMAIL_VARS_OK =
+  !!process.env.GMAIL_CLIENT_ID &&
+  !!process.env.GMAIL_CLIENT_SECRET &&
+  !!process.env.GMAIL_REFRESH_TOKEN &&
+  !!process.env.EMAIL_USER;
+if (!GMAIL_VARS_OK) {
+  console.warn(
+    '[Gmail] ⚠️  One or more Gmail env vars are missing (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, EMAIL_USER). ' +
+    'Forgot-password emails will fail. Set these in your Railway / Render environment variables.'
+  );
+}
+
 async function getGmailAccessToken(): Promise<string> {
+  if (!GMAIL_VARS_OK) {
+    throw new Error('Gmail credentials are not configured on this server. Contact the administrator.');
+  }
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -270,7 +286,14 @@ async function getGmailAccessToken(): Promise<string> {
     }),
   });
   const data: any = await res.json();
-  if (!data.access_token) throw new Error(`Gmail OAuth token error: ${JSON.stringify(data)}`);
+  if (!data.access_token) {
+    // Log the full OAuth error server-side but surface a clean message to the client
+    console.error('[Gmail] OAuth token fetch failed:', JSON.stringify(data));
+    const hint = data.error === 'invalid_grant'
+      ? 'The Gmail refresh token has expired. Please re-authorise the Gmail OAuth app and update GMAIL_REFRESH_TOKEN.'
+      : `Gmail OAuth error: ${data.error || 'unknown'} — ${data.error_description || ''}`;
+    throw new Error(hint);
+  }
   return data.access_token;
 }
 
@@ -327,10 +350,11 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
     await PasswordResetOtp.create({ email: emailLower, otp, expiresAt });
 
     // Send OTP via Gmail REST API (pure HTTPS — not SMTP, works on Railway)
-    await sendGmailEmail(
-      emailLower,
-      'Your OcnoDetect Password Reset OTP',
-      `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
+    try {
+      await sendGmailEmail(
+        emailLower,
+        'Your OcnoDetect Password Reset OTP',
+        `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 480px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
           <div style="background: #0ea5e9; padding: 28px 32px; text-align: center;">
             <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">Ocno<span style="color: #bae6fd;">Detect</span></span>
             <p style="color: #e0f2fe; font-size: 13px; margin: 6px 0 0 0;">Clinical Intelligence Platform</p>
@@ -352,13 +376,21 @@ app.post('/api/auth/forgot-password', authLimiter, async (req: Request, res: Res
             <p style="color: #cbd5e1; font-size: 11px; margin: 4px 0 0 0;">Do not reply to this email · This is an automated message</p>
           </div>
         </div>`
-    );
+      );
+      console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
+    } catch (emailErr: any) {
+      console.error('[Auth] Failed to send OTP email:', emailErr.message);
+      // Clean up the OTP so it can't be used without delivery
+      await PasswordResetOtp.deleteMany({ email: emailLower }).catch(() => {});
+      return res.status(503).json({
+        error: 'Unable to send OTP email at this time. Please try again later or contact support.',
+      });
+    }
 
-    console.log(`[Auth] Password reset OTP sent to: ${emailLower}`);
     res.json({ success: true, message: 'If this email is registered, an OTP has been sent.' });
   } catch (err: any) {
     console.error('Error in /api/auth/forgot-password:', err);
-    res.status(500).json({ error: err.message || 'Failed to send OTP email. Please try again.' });
+    res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
   }
 });
 
