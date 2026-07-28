@@ -87,9 +87,11 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY || '',
 });
 
-// Initialize Gemini SDK
-const geminiApiKey = process.env.GEMINI_API_KEY || '';
-const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+// Initialize Gemini SDK helper (reads live process.env.GEMINI_API_KEY on call)
+const getGeminiClient = () => {
+  const apiKey = process.env.GEMINI_API_KEY || '';
+  return apiKey.trim() ? new GoogleGenAI({ apiKey: apiKey.trim() }) : null;
+};
 
 // Helper: safe JSON extraction from model response
 function extractJSON(text: string): any {
@@ -756,6 +758,7 @@ Crucial Guidelines:
 
     if (isImage) {
       let geminiSuccess = false;
+      const ai = getGeminiClient();
       if (ai) {
         try {
           console.log(`Analyzing image via Gemini Model (gemini-3.1-flash-lite) for user ${userId}...`);
@@ -834,6 +837,7 @@ Crucial Guidelines:
       let geminiTextSuccess = false;
       const textPrompt = `Analyze the following patient report / imaging details. First analyze and tell if valid. If it does not contain relevant oncology medical details, you MUST return a JSON object with: { "isValid": false, "error": "invalid" }.\n\n${rawText}${userPatientId ? `\n\nPatient ID: ${userPatientId}` : ''}`;
 
+      const ai = getGeminiClient();
       if (ai) {
         try {
           console.log(`Generating AI clinical summary via Gemini Model (gemini-3.1-flash-lite) for user ${userId}...`);
@@ -1247,9 +1251,10 @@ app.delete('/api/chat-sessions/:sessionId', authenticateToken as any, async (req
 
 // Start the server
 app.listen(port, () => {
+  const geminiAvailable = !!(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim());
   console.log(`====================================================`);
   console.log(`ScanWise AI backend server running on port ${port}`);
-  console.log(`[AI Configuration] Primary Vision: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (qwen/qwen3.6-27b)'}`);
-  console.log(`[AI Configuration] Primary Text: ${ai ? 'Gemini (gemini-3.1-flash-lite)' : 'Groq Fallback (llama-3.1-8b-instant)'}`);
+  console.log(`[AI Configuration] Primary Vision: ${geminiAvailable ? 'Gemini (gemini-3.1-flash-lite) [Fallback: Groq qwen/qwen3.6-27b]' : 'Groq Fallback (qwen/qwen3.6-27b)'}`);
+  console.log(`[AI Configuration] Primary Text: ${geminiAvailable ? 'Gemini (gemini-3.1-flash-lite) [Fallback: Groq llama-3.1-8b-instant]' : 'Groq Fallback (llama-3.1-8b-instant)'}`);
   console.log(`====================================================`);
 });
